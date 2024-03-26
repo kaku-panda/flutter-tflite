@@ -14,39 +14,7 @@ import 'package:live_object_detection_ssd_mobilenet/models/recognition.dart';
 import 'package:live_object_detection_ssd_mobilenet/utils/image_utils.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
-///////////////////////////////////////////////////////////////////////////////
-// **WARNING:** This is not production code and is only intended to be used for
-// demonstration purposes.
-//
-// The following Detector example works by spawning a background isolate and
-// communicating with it over Dart's SendPort API. It is presented below as a
-// demonstration of the feature "Background Isolate Channels" and shows using
-// plugins from a background isolate. The [Detector] operates on the root
-// isolate and the [_DetectorServer] operates on a background isolate.
-//
-// Here is an example of the protocol they use to communicate:
-//
-//  _________________                         ________________________
-//  [:Detector]                               [:_DetectorServer]
-//  -----------------                         ------------------------
-//         |                                              |
-//         |<---------------(init)------------------------|
-//         |----------------(init)----------------------->|
-//         |<---------------(ready)---------------------->|
-//         |                                              |
-//         |----------------(detect)--------------------->|
-//         |<---------------(busy)------------------------|
-//         |<---------------(result)----------------------|
-//         |                 . . .                        |
-//         |----------------(detect)--------------------->|
-//         |<---------------(busy)------------------------|
-//         |<---------------(result)----------------------|
-//
-///////////////////////////////////////////////////////////////////////////////
-
-/// All the command codes that can be sent and received between [Detector] and
-/// [_DetectorServer].
-enum _Codes {
+enum Codes {
   init,
   busy,
   ready,
@@ -54,88 +22,101 @@ enum _Codes {
   result,
 }
 
-/// A command sent between [Detector] and [_DetectorServer].
-class _Command {
-  const _Command(this.code, {this.args});
+class Command {
+  const Command(this.code, {this.args});
 
-  final _Codes code;
+  final Codes code;
   final List<Object>? args;
 }
 
-/// A Simple Detector that handles object detection via Service
-///
-/// All the heavy operations like pre-processing, detection, ets,
-/// are executed in a background isolate.
-/// This class just sends and receives messages to the isolate.
 class Detector {
-  static const String _modelPath = 'assets/models/ssd_mobilenet.tflite';
-  static const String _labelPath = 'assets/models/labelmap.txt';
+  static const String modelPath = 'assets/models/ssd_mobilenet.tflite';
+  static const String labelPath = 'assets/models/ssd_mobilenet.txt';
+  // static const String modelPath = 'assets/models/yolov5n_float32.tflite';
+  // static const String labelPath = 'assets/models/yolov5n_float32.txt';
 
-  Detector._(this._isolate, this._interpreter, this._labels);
+  Detector(
+    this.isolate,
+    this.interpreter,
+    this.labels,
+  );
 
-  final Isolate _isolate;
-  late final Interpreter _interpreter;
-  late final List<String> _labels;
+  final      Isolate      isolate;
+  late final Interpreter  interpreter;
+  late final List<String> labels;
 
-  // To be used by detector (from UI) to send message to our Service ReceivePort
-  late final SendPort _sendPort;
+  late final SendPort sendPort;
+  
+  bool isReady = false;
 
-  bool _isReady = false;
+  final StreamController<Map<String,dynamic>> resultsStream = StreamController<Map<String,dynamic>>();
 
-  // // Similarly, StreamControllers are stored in a queue so they can be handled
-  // // asynchronously and serially.
-  final StreamController<Map<String, dynamic>> resultsStream =
-      StreamController<Map<String, dynamic>>();
-
-  /// Open the database at [path] and launch the server on a background isolate..
   static Future<Detector> start() async {
+    
     final ReceivePort receivePort = ReceivePort();
-    // sendPort - To be used by service Isolate to send message to our ReceiverPort
-    final Isolate isolate =
-        await Isolate.spawn(_DetectorServer._run, receivePort.sendPort);
-
-    final Detector result = Detector._(
-      isolate,
-      await _loadModel(),
-      await _loadLabels(),
+    
+    final Isolate isolate = await Isolate.spawn(
+      DetectorServer.run,
+      receivePort.sendPort,
     );
+
+    final Detector result = Detector(
+      isolate,
+      await loadModel(),
+      await loadLabels(),
+    );
+
     receivePort.listen((message) {
-      result._handleCommand(message as _Command);
+      result.handleCommand(message as Command);
     });
     return result;
   }
 
-  static Future<Interpreter> _loadModel() async {
+  static Future<Interpreter> loadModel() async {
+
     final interpreterOptions = InterpreterOptions();
 
     // Use XNNPACK Delegate
     if (Platform.isAndroid) {
       interpreterOptions.addDelegate(XNNPackDelegate());
     }
+    if (Platform.isIOS) {
+      final gpuDelegate = GpuDelegate(
+        options: GpuDelegateOptions(
+          allowPrecisionLoss: true,
+        ),
+      );
+      interpreterOptions.addDelegate(gpuDelegate);
+    }
 
     return Interpreter.fromAsset(
-      _modelPath,
+      modelPath,
       options: interpreterOptions..threads = 4,
     );
   }
 
-  static Future<List<String>> _loadLabels() async {
-    return (await rootBundle.loadString(_labelPath)).split('\n');
+  static Future<List<String>> loadLabels() async {
+    return (await rootBundle.loadString(labelPath)).split('\n');
   }
 
   /// Starts CameraImage processing
   void processFrame(CameraImage cameraImage) {
-    if (_isReady) {
-      _sendPort.send(_Command(_Codes.detect, args: [cameraImage]));
+    if (isReady) {
+      sendPort.send(
+        Command(
+          Codes.detect,
+          args: [cameraImage],
+        ),
+      );
     }
   }
 
   /// Handler invoked when a message is received from the port communicating
   /// with the database server.
-  void _handleCommand(_Command command) {
+  void handleCommand(Command command) {
     switch (command.code) {
-      case _Codes.init:
-        _sendPort = command.args?[0] as SendPort;
+      case Codes.init:
+        sendPort = command.args?[0] as SendPort;
         // ----------------------------------------------------------------------
         // Before using platform channels and plugins from background isolates we
         // need to register it with its root isolate. This is achieved by
@@ -143,17 +124,17 @@ class Detector {
         // invoke [BackgroundIsolateBinaryMessenger.ensureInitialized].
         // ----------------------------------------------------------------------
         RootIsolateToken rootIsolateToken = RootIsolateToken.instance!;
-        _sendPort.send(_Command(_Codes.init, args: [
+        sendPort.send(Command(Codes.init, args: [
           rootIsolateToken,
-          _interpreter.address,
-          _labels,
+          interpreter.address,
+          labels,
         ]));
-      case _Codes.ready:
-        _isReady = true;
-      case _Codes.busy:
-        _isReady = false;
-      case _Codes.result:
-        _isReady = true;
+      case Codes.ready:
+        isReady = true;
+      case Codes.busy:
+        isReady = false;
+      case Codes.result:
+        isReady = true;
         resultsStream.add(command.args?[0] as Map<String, dynamic>);
       default:
         debugPrint('Detector unrecognized command: ${command.code}');
@@ -162,7 +143,7 @@ class Detector {
 
   /// Kills the background isolate and its detector server.
   void stop() {
-    _isolate.kill();
+    isolate.kill();
   }
 }
 
@@ -170,39 +151,40 @@ class Detector {
 ///
 /// This is where we use the new feature Background Isolate Channels, which
 /// allows us to use plugins from background isolates.
-class _DetectorServer {
+class DetectorServer {
   /// Input size of image (height = width = 300)
   static const int mlModelInputSize = 300;
+  // static const int mlModelInputSize = 640;
 
   /// Result confidence threshold
   static const double confidence = 0.5;
-  Interpreter? _interpreter;
-  List<String>? _labels;
+  Interpreter? interpreter;
+  List<String>? labels;
 
-  _DetectorServer(this._sendPort);
+  DetectorServer(this.sendPort);
 
-  final SendPort _sendPort;
+  final SendPort sendPort;
 
   // ----------------------------------------------------------------------
   // Here the plugin is used from the background isolate.
   // ----------------------------------------------------------------------
 
   /// The main entrypoint for the background isolate sent to [Isolate.spawn].
-  static void _run(SendPort sendPort) {
+  static void run(SendPort sendPort) {
     ReceivePort receivePort = ReceivePort();
-    final _DetectorServer server = _DetectorServer(sendPort);
+    final DetectorServer server = DetectorServer(sendPort);
     receivePort.listen((message) async {
-      final _Command command = message as _Command;
+      final Command command = message as Command;
       await server._handleCommand(command);
     });
     // receivePort.sendPort - used by UI isolate to send commands to the service receiverPort
-    sendPort.send(_Command(_Codes.init, args: [receivePort.sendPort]));
+    sendPort.send(Command(Codes.init, args: [receivePort.sendPort]));
   }
 
   /// Handle the [command] received from the [ReceivePort].
-  Future<void> _handleCommand(_Command command) async {
+  Future<void> _handleCommand(Command command) async {
     switch (command.code) {
-      case _Codes.init:
+      case Codes.init:
         // ----------------------------------------------------------------------
         // The [RootIsolateToken] is required for
         // [BackgroundIsolateBinaryMessenger.ensureInitialized] and must be
@@ -218,11 +200,11 @@ class _DetectorServer {
         // the background isolate.
         // ----------------------------------------------------------------------
         BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
-        _interpreter = Interpreter.fromAddress(command.args?[1] as int);
-        _labels = command.args?[2] as List<String>;
-        _sendPort.send(const _Command(_Codes.ready));
-      case _Codes.detect:
-        _sendPort.send(const _Command(_Codes.busy));
+        interpreter = Interpreter.fromAddress(command.args?[1] as int);
+        labels = command.args?[2] as List<String>;
+        sendPort.send(const Command(Codes.ready));
+      case Codes.detect:
+        sendPort.send(const Command(Codes.busy));
         _convertCameraImage(command.args?[0] as CameraImage);
       default:
         debugPrint('_DetectorService unrecognized command ${command.code}');
@@ -232,30 +214,32 @@ class _DetectorServer {
   void _convertCameraImage(CameraImage cameraImage) {
     var preConversionTime = DateTime.now().millisecondsSinceEpoch;
 
-    convertCameraImageToImage(cameraImage).then((image) {
-      if (image != null) {
-        if (Platform.isAndroid) {
-          image = image_lib.copyRotate(image, angle: 90);
+    convertCameraImageToImage(cameraImage).then(
+      (image) {
+        if (image != null) {
+          if (Platform.isAndroid) {
+            image = image_lib.copyRotate(image, angle: 90);
+          }
+          final results = analyseImage(image, preConversionTime);
+          sendPort.send(Command(Codes.result, args: [results]));
         }
-
-        final results = analyseImage(image, preConversionTime);
-        _sendPort.send(_Command(_Codes.result, args: [results]));
-      }
-    });
+      },
+    );
   }
 
   Map<String, dynamic> analyseImage(
-      image_lib.Image? image, int preConversionTime) {
-    var conversionElapsedTime =
-        DateTime.now().millisecondsSinceEpoch - preConversionTime;
+    image_lib.Image image,
+    int preConversionTime
+  ) {
+    var conversionElapsedTime = DateTime.now().millisecondsSinceEpoch - preConversionTime;
 
     var preProcessStart = DateTime.now().millisecondsSinceEpoch;
 
     /// Pre-process the image
     /// Resizing image for model [300, 300]
-    final imageInput = image_lib.copyResize(
-      image!,
-      width: mlModelInputSize,
+    final image_lib.Image imageInput = image_lib.copyResize(
+      image,
+      width:  mlModelInputSize,
       height: mlModelInputSize,
     );
 
@@ -276,7 +260,7 @@ class _DetectorServer {
 
     var inferenceTimeStart = DateTime.now().millisecondsSinceEpoch;
 
-    final output = _runInference(imageMatrix);
+    final output = runInference(imageMatrix);
 
     // Location
     final locationsRaw = output.first.first as List<List<double>>;
@@ -299,7 +283,7 @@ class _DetectorServer {
 
     final List<String> classification = [];
     for (var i = 0; i < numberOfDetections; i++) {
-      classification.add(_labels![classes[i]]);
+      classification.add(labels![classes[i]]);
     }
 
     /// Generate recognitions
@@ -336,9 +320,9 @@ class _DetectorServer {
   }
 
   /// Object detection main function
-  List<List<Object>> _runInference(
+  List<List<Object>> runInference(
     List<List<List<num>>> imageMatrix,
-  ) {
+  ){
     // Set input tensor [1, 300, 300, 3]
     final input = [imageMatrix];
 
@@ -354,7 +338,7 @@ class _DetectorServer {
       3: [0.0],
     };
 
-    _interpreter!.runForMultipleInputs([input], output);
+    interpreter!.runForMultipleInputs([input], output);
     return output.values.toList();
   }
 }

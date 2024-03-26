@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:isolate';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -9,108 +8,95 @@ import 'package:live_object_detection_ssd_mobilenet/service/detector_service.dar
 import 'package:live_object_detection_ssd_mobilenet/ui/box_widget.dart';
 import 'package:live_object_detection_ssd_mobilenet/ui/stats_widget.dart';
 
-/// [DetectorWidget] sends each frame for inference
+/// sends each frame for inference
 class DetectorWidget extends StatefulWidget {
-  /// Constructor
+  
   const DetectorWidget({super.key});
 
   @override
-  State<DetectorWidget> createState() => _DetectorWidgetState();
+  State<DetectorWidget> createState() => DetectorWidgetState();
 }
 
-class _DetectorWidgetState extends State<DetectorWidget>
-    with WidgetsBindingObserver {
-  /// List of available cameras
+class DetectorWidgetState extends State<DetectorWidget> with WidgetsBindingObserver {
+  
   late List<CameraDescription> cameras;
 
-  /// Controller
-  CameraController? _cameraController;
+  CameraController? cameraController;
+  get controller => cameraController;
 
-  // use only when initialized, so - not null
-  get _controller => _cameraController;
+  Detector? detector;
+  StreamSubscription? subscription;
 
-  /// Object Detector is running on a background [Isolate]. This is nullable
-  /// because acquiring a [Detector] is an asynchronous operation. This
-  /// value is `null` until the detector is initialized.
-  Detector? _detector;
-  StreamSubscription? _subscription;
-
-  /// Results to draw bounding boxes
   List<Recognition>? results;
 
-  /// Realtime stats
   Map<String, String>? stats;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _initStateAsync();
+    initStateAsync();
   }
 
-  void _initStateAsync() async {
+  void initStateAsync() async {
     // initialize preview and CameraImage stream
-    _initializeCamera();
+    initializeCamera();
     // Spawn a new isolate
-    Detector.start().then((instance) {
-      setState(() {
-        _detector = instance;
-        _subscription = instance.resultsStream.stream.listen((values) {
-          setState(() {
-            results = values['recognitions'];
-            stats = values['stats'];
-          });
+    Detector.start().then(
+      (instance) {
+        setState(() {
+          detector = instance;
+          subscription = instance.resultsStream.stream.listen(
+            (values) {
+              setState(() {
+                results = values['recognitions'];
+                stats   = values['stats'];
+              });
+            },
+          );
         });
-      });
-    });
+      },
+    );
   }
 
-  /// Initializes the camera by setting [_cameraController]
-  void _initializeCamera() async {
+  void initializeCamera() async {
     cameras = await availableCameras();
-    // cameras[0] for back-camera
-    _cameraController = CameraController(
+    cameraController = CameraController(
       cameras[0],
-      ResolutionPreset.medium,
+      ResolutionPreset.low,
       enableAudio: false,
     )..initialize().then((_) async {
-        await _controller.startImageStream(onLatestImageAvailable);
-        setState(() {});
-
-        /// previewSize is size of each image frame captured by controller
-        ///
-        /// 352x288 on iOS, 240p (320x240) on Android with ResolutionPreset.low
-        ScreenParams.previewSize = _controller.value.previewSize!;
-      });
+      await controller.startImageStream(onLatestImageAvailable);
+      setState(() {});
+      ScreenParams.previewSize = controller.value.previewSize!;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    // Return empty container while the camera is not initialized
-    if (_cameraController == null || !_controller.value.isInitialized) {
+    
+    if (cameraController == null || !controller.value.isInitialized) {
       return const SizedBox.shrink();
     }
 
-    var aspect = 1 / _controller.value.aspectRatio;
+    var aspect = 1 / controller.value.aspectRatio;
 
     return Stack(
       children: [
         AspectRatio(
           aspectRatio: aspect,
-          child: CameraPreview(_controller),
+          child: CameraPreview(controller),
         ),
-        // Stats
-        _statsWidget(),
-        // Bounding boxes
+        statsWidget(),
         AspectRatio(
           aspectRatio: aspect,
-          child: _boundingBoxes(),
+          child: boundingBoxes(),
         ),
       ],
     );
   }
 
-  Widget _statsWidget() => (stats != null)
+  Widget statsWidget() => (stats != null)
       ? Align(
           alignment: Alignment.bottomCenter,
           child: Container(
@@ -129,7 +115,7 @@ class _DetectorWidgetState extends State<DetectorWidget>
       : const SizedBox.shrink();
 
   /// Returns Stack of bounding boxes
-  Widget _boundingBoxes() {
+  Widget boundingBoxes() {
     if (results == null) {
       return const SizedBox.shrink();
     }
@@ -139,19 +125,19 @@ class _DetectorWidgetState extends State<DetectorWidget>
 
   /// Callback to receive each frame [CameraImage] perform inference on it
   void onLatestImageAvailable(CameraImage cameraImage) async {
-    _detector?.processFrame(cameraImage);
+    detector?.processFrame(cameraImage);
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) async {
     switch (state) {
       case AppLifecycleState.inactive:
-        _cameraController?.stopImageStream();
-        _detector?.stop();
-        _subscription?.cancel();
+        cameraController?.stopImageStream();
+        detector?.stop();
+        subscription?.cancel();
         break;
       case AppLifecycleState.resumed:
-        _initStateAsync();
+        initStateAsync();
         break;
       default:
     }
@@ -160,9 +146,9 @@ class _DetectorWidgetState extends State<DetectorWidget>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _cameraController?.dispose();
-    _detector?.stop();
-    _subscription?.cancel();
+    cameraController?.dispose();
+    detector?.stop();
+    subscription?.cancel();
     super.dispose();
   }
 }
